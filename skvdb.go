@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"container/list"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/adler32"
 	"io"
+	"math/rand"
 	"os"
 	"path"
+	"sync"
 	"time"
 )
 
@@ -46,17 +49,21 @@ func (r *record) byteSize() uint32 {
 //SkvDB skvdb
 type SkvDB struct {
 	dataDir     string
-	partitions  int64
+	partitions  uint64
 	fdMap       map[string]*os.File
 	preFd       *os.File
 	preFilename string
+	//counter
+	counter     uint64
+	counterIdx  uint64
+	counterLock *sync.Mutex
 }
 
 //Key key, 20 bytes
 type Key struct {
-	MachineCode int32 //4 byte
-	Timestamp   int64 //8 bytes
-	Counter     int64 //8 bytes
+	Rand      uint32 //4 byte
+	Timestamp uint64 //8 bytes
+	Counter   uint64 //8 bytes
 }
 
 //Equals check two keys if equals
@@ -64,18 +71,13 @@ func (k *Key) Equals(k1 *Key) bool {
 	if k1 == nil {
 		return false
 	}
-	return k.MachineCode == k1.MachineCode && k.Timestamp == k1.Timestamp && k.Counter == k1.Counter
+	return k.Rand == k1.Rand && k.Timestamp == k1.Timestamp && k.Counter == k1.Counter
 }
 
 //Equals check two keys if equals
 func (k *Key) compare(k1 *Key) int {
 	if k1 == nil {
 		return 1
-	}
-	if k.Timestamp > k1.Timestamp {
-		return 1
-	} else if k.Timestamp < k1.Timestamp {
-		return -1
 	}
 	if k.Counter > k1.Counter {
 		return 1
@@ -86,29 +88,59 @@ func (k *Key) compare(k1 *Key) int {
 }
 
 func (k *Key) String() string {
-	return fmt.Sprintf("MachineCode:%d, Timestamp:%d, Counter:%d", k.MachineCode, k.Timestamp, k.Counter)
+	return fmt.Sprintf("Rand:%d, Timestamp:%d, Counter:%d", k.Rand, k.Timestamp, k.Counter)
 }
 
-func (k *Key) hash() int64 {
-	result := int64(1)
-	result = int64(31)*result + int64(k.MachineCode)
-	result = int64(31)*result + k.Timestamp
-	result = int64(31)*result + k.Counter
+//HexString key hex string
+func (k *Key) HexString() string {
+	buf := new(bytes.Buffer)
+	rt := uint64(k.Rand)<<40 | k.Timestamp
+	binary.Write(buf, binary.BigEndian, rt)
+	binary.Write(buf, binary.BigEndian, k.Counter)
+	return hex.EncodeToString(buf.Bytes())
+}
+
+//NewKey create a key from a key string
+func NewKey(key string) (*Key, error) {
+	if len(key) != 32 {
+		return nil, fmt.Errorf("invalid key[%s]'s len[%d]", key, len(key))
+	}
+	payload, err := hex.DecodeString(key)
+	if err != nil {
+		return nil, fmt.Errorf("invalid key[%s]", key)
+	}
+	buf := bytes.NewBuffer(payload)
+	var rt uint64
+	var counter uint64
+	if err := binary.Read(buf, binary.BigEndian, &rt); err != nil {
+		return nil, fmt.Errorf("invalid key[%s]", key)
+	}
+	if err := binary.Read(buf, binary.BigEndian, &counter); err != nil {
+		return nil, fmt.Errorf("invalid key[%s]", key)
+	}
+	return &Key{Rand: uint32(rt >> 40), Timestamp: rt << 24 >> 24, Counter: counter}, nil
+}
+
+func (k *Key) hash() uint64 {
+	result := uint64(1)
+	result = uint64(31)*result + uint64(k.Rand)
+	result = uint64(31)*result + k.Timestamp
+	result = uint64(31)*result + k.Counter
 	return result
 }
 
 //New create one skvdb instance
-func New(dataDir string, partitions int64) *SkvDB {
-	return &SkvDB{dataDir: dataDir, partitions: partitions, fdMap: make(map[string]*os.File)}
+func New(dataDir string, partitions uint64) *SkvDB {
+	return &SkvDB{dataDir: dataDir, partitions: partitions, fdMap: make(map[string]*os.File), counterLock: new(sync.Mutex)}
 }
 
 func (skv *SkvDB) key2Filename(key *Key) string {
-	t := time.Unix(key.Timestamp/1000000000, 0)
-	index := key.hash() % skv.partitions
+	t := time.Unix(int64(key.Timestamp), 0)
+	index := (uint64(31)*(uint64(31)+uint64(key.Rand))+key.Timestamp) % skv.partitions
 	if index < 0 {
 		index = -index
 	}
-	return fmt.Sprintf("%s/%s/%d/%d.dat", skv.dataDir, t.Format("2006-01-02"), key.MachineCode, index)
+	return fmt.Sprintf("%s/%s/%d.dat", skv.dataDir, t.Format("2006-01-02"), index)
 }
 
 func (skv *SkvDB) readNextRecord(offset int64, fd *os.File, endOffset int64) (*record, error) {
@@ -157,18 +189,15 @@ func (skv *SkvDB) readNextRecord(offset int64, fd *os.File, endOffset int64) (*r
 		}
 		if found {
 			newOffset := offset + recordStartOffset + lenOfSkvr
-			if newOffset >= endOffset {
-				return nil, errorNoNextRecord
-			}
 			if _, err := fd.Seek(newOffset, 0); err != nil {
 				return nil, err
 			}
 			record, err := skv.tryReadRecord(fd)
 			if err != nil {
+				if _, err := fd.Seek(newOffset, 0); err != nil {
+					return nil, err
+				}
 				continue
-			}
-			if _, err := fd.Seek(newOffset, 0); err != nil {
-				return nil, err
 			}
 			return record, nil
 		}
@@ -199,7 +228,7 @@ func (skv *SkvDB) tryReadRecord(fd *os.File) (*record, error) {
 		return nil, fmt.Errorf("checksum error")
 	}
 	payloadBuffer := bytes.NewBuffer(payload)
-	if err := binary.Read(payloadBuffer, binary.BigEndian, &key.MachineCode); err != nil {
+	if err := binary.Read(payloadBuffer, binary.BigEndian, &key.Rand); err != nil {
 		return nil, err
 	}
 	if err := binary.Read(payloadBuffer, binary.BigEndian, &key.Timestamp); err != nil {
@@ -213,8 +242,17 @@ func (skv *SkvDB) tryReadRecord(fd *os.File) (*record, error) {
 	return &record, nil
 }
 
-//Query query value by key
-func (skv *SkvDB) Query(key *Key) ([]byte, error) {
+//Query query value by key string
+func (skv *SkvDB) Query(key string) ([]byte, error) {
+	_key, err := NewKey(key)
+	if err != nil {
+		return nil, err
+	}
+	return skv.QueryByKey(_key)
+}
+
+//QueryByKey query value by key
+func (skv *SkvDB) QueryByKey(key *Key) ([]byte, error) {
 	if key == nil {
 		return nil, errorEmptyKey
 	}
@@ -249,7 +287,7 @@ func (skv *SkvDB) Query(key *Key) ([]byte, error) {
 				}
 			}
 			if err == errorNoNextRecord {
-				stack.PushBack([]int64{start, end - 1})
+				stack.PushBack([]int64{start, mid - 1})
 				continue
 			}
 			switch key.compare(record.key) {
@@ -268,22 +306,20 @@ func (skv *SkvDB) Query(key *Key) ([]byte, error) {
 }
 
 //Save save record in key value
-func (skv *SkvDB) Save(key *Key, val []byte) error {
-	if key == nil {
-		return errorEmptyKey
-	}
-	filename := skv.key2Filename(key)
+func (skv *SkvDB) Save(val []byte) (Key, error) {
+	key := Key{Rand: rand.Uint32() >> 8, Timestamp: uint64(time.Now().Unix())}
 
+	filename := skv.key2Filename(&key)
 	ok := false
 	var fd *os.File
 	if fd, ok = skv.fdMap[filename]; !ok {
 		err := os.MkdirAll(path.Dir(filename), 0600)
 		if err != nil {
-			return err
+			return key, err
 		}
 		fd, err = os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 		if err != nil {
-			return err
+			return key, err
 		}
 		skv.fdMap[filename] = fd
 	}
@@ -294,50 +330,42 @@ func (skv *SkvDB) Save(key *Key, val []byte) error {
 					delete(skv.fdMap, _filename)
 					_fd.Close()
 				}(skv.preFd, skv.preFilename)
-				fmt.Println("close pre fd")
 			}
 			skv.preFd = fd
 			skv.preFilename = filename
-			fmt.Println("set pre fd")
 		}
-		buf := new(bytes.Buffer)
-		if err := binary.Write(buf, binary.BigEndian, key.MachineCode); err != nil {
-			return err
-		}
-		if err := binary.Write(buf, binary.BigEndian, key.Timestamp); err != nil {
-			return err
-		}
-		if err := binary.Write(buf, binary.BigEndian, key.Counter); err != nil {
-			return err
-		}
-		if _, err := buf.Write(val); err != nil {
-			return err
-		}
-		payload := buf.Bytes()
-		lenOfPayload := uint32(len(payload))
-		if lenOfPayload > maxLenOfPayload {
-			return fmt.Errorf("reach max length of payload, len:%d", lenOfPayload)
-		}
-		checksum := adler32.Checksum(payload)
-		rBuf := new(bytes.Buffer)
-		if _, err := rBuf.Write(skvrMagic); err != nil {
-			return err
-		}
-		if err := binary.Write(rBuf, binary.BigEndian, checksum); err != nil {
-			return err
-		}
-		if err := binary.Write(rBuf, binary.BigEndian, uint32(len(payload))); err != nil {
-			return err
-		}
-		if _, err := rBuf.Write(payload); err != nil {
-			return err
-		}
-		if _, err := fd.Write(rBuf.Bytes()); err != nil {
-			return err
-		}
-		if err := fd.Sync(); err != nil {
+		counter, err := skv.getCounter(func(counter uint64) error {
+			key.Counter = counter
+			buf := new(bytes.Buffer)
+			binary.Write(buf, binary.BigEndian, key.Rand)
+			binary.Write(buf, binary.BigEndian, key.Timestamp)
+			binary.Write(buf, binary.BigEndian, key.Counter)
+			buf.Write(val)
+
+			payload := buf.Bytes()
+			lenOfPayload := uint32(len(payload))
+			if lenOfPayload > maxLenOfPayload {
+				return fmt.Errorf("reach max length of payload, len:%d", lenOfPayload)
+			}
+			checksum := adler32.Checksum(payload)
+			rBuf := new(bytes.Buffer)
+			rBuf.Write(skvrMagic)
+			binary.Write(rBuf, binary.BigEndian, checksum)
+			binary.Write(rBuf, binary.BigEndian, uint32(len(payload)))
+			rBuf.Write(payload)
+
+			if _, err := fd.Write(rBuf.Bytes()); err != nil {
+				return err
+			}
+			if err := fd.Sync(); err != nil {
+				return err
+			}
 			return nil
+		})
+		if err != nil {
+			return key, err
 		}
+		key.Counter = counter
 	}
-	return nil
+	return key, nil
 }
