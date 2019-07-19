@@ -1,8 +1,10 @@
 package skvdb
 
 import (
+	"io"
 	"math/rand"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -49,24 +51,85 @@ func TestSave(t *testing.T) {
 	}
 }
 
-func TestReadNextRecord(t *testing.T) {
-	db := New("./", 10)
-	fd, err := os.OpenFile("./2019-07-18/7.dat", os.O_RDONLY, 0660)
-	record, err := db.readNextRecord(1, fd, 10000000)
-	if err != nil {
-		t.Fatal("failed to query", err)
-	}
-	t.Log(record)
-}
-
 func TestQuery(t *testing.T) {
 	db := New("./", 10)
-	payload, err := db.Query("a0a883005d3050ee00000000000013a2")
+	key := "3a4c53005d3165150000000000001d18"
+	payload, err := db.Query(key)
 	if err != nil {
 		t.Fatal("failed to query", err)
 	}
-	if string(payload) != "testing" {
+	if len(string(payload)) < 0 {
 		t.Fatalf("failed to query, payload[%s] not correct, cause by:%v", string(payload), err)
+	}
+}
+func TestReadNextRecord(t *testing.T) {
+	db := New("./", 10)
+	fd, err := os.OpenFile("./2019-07-19/7.dat", os.O_RDONLY, 0660)
+	if err != nil {
+		t.Fatal("failed to open file")
+	}
+	fi, err := fd.Stat()
+	if err != nil {
+		t.Fatal("failed to stat file")
+	}
+	record, err := db.readNextRecord(int64(6094521), fd, fi.Size())
+	if err != nil {
+		t.Fatal("failed to read next record")
+	}
+	t.Log(record.key)
+	record, err = db.readNextRecord(int64(6094586), fd, fi.Size())
+	if err != nil {
+		t.Fatal("failed to read next record")
+	}
+	t.Log(record.key)
+	record, err = db.readNextRecord(int64(6104223), fd, fi.Size())
+	if err != nil {
+		t.Fatal("failed to read next record")
+	}
+	t.Log(record.key)
+}
+
+func TestReadSequence(t *testing.T) {
+	db := New("./", 10)
+	fd, err := os.OpenFile("./2019-07-19/7.dat", os.O_RDONLY, 0660)
+	if err != nil {
+		t.Fatal("failed to open file")
+	}
+	offset, err := fd.Seek(int64(6094521), 0)
+	if err != nil {
+		t.Fatal("failed to read offset", err)
+	}
+	t.Logf("offset:%d", offset)
+	skvr := make([]byte, 4)
+	for {
+		offset, err := fd.Seek(0, 1)
+		if err != nil {
+			t.Fatal("failed to read offset", err)
+		}
+		t.Logf("offset start:%d", offset)
+		n, err := fd.Read(skvr)
+		if err != nil {
+			if err != io.EOF {
+				t.Fatal("failed to read skvr")
+			}
+		}
+		if n < 1 {
+			t.Logf("EOF, n:%d", n)
+			break
+		}
+		record, err := db.tryReadRecord(fd)
+		if err != nil {
+			t.Fatal("failed to read record")
+		}
+		if record.key.Counter == 7666 {
+			t.Log("hello world")
+		}
+		t.Log(record.key)
+		offset, err = fd.Seek(0, 1)
+		if err != nil {
+			t.Fatal("failed to read offset", err)
+		}
+		t.Logf("offset end:%d", offset)
 	}
 }
 
@@ -86,5 +149,54 @@ func TestNewKey(t *testing.T) {
 	}
 	if key.Rand != 3441759 || key.Timestamp != 1563419954 || key.Counter != 3 {
 		t.Fatalf("invalid key:%s", key)
+	}
+}
+
+func TestSaveAndQuery(t *testing.T) {
+	db := New(".", 10)
+	size := 100000
+	m := make(map[string]string)
+	for i := 0; i < size; i++ {
+		val := genVal()
+		key, err := db.Save([]byte(val))
+		if err != nil {
+			t.Fatal("failed to save", err)
+		}
+		m[key.HexString()] = val
+	}
+
+	for k, v := range m {
+		payload, err := db.Query(k)
+		if err != nil {
+			t.Fatalf("failed to query, key: %s, cause by:%s", k, err)
+		}
+		if v != string(payload) {
+			t.Fatalf("failed to query, key: %s, cause by:%s", k, err)
+		}
+	}
+}
+
+func genVal() string {
+	str := []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789~!@#$%^&*()_+-=;:\"'|\\<,>.?/`")
+	size := rand.Intn(50000)
+	var sb strings.Builder
+	for i := 0; i < size; i++ {
+		sb.WriteByte(str[rand.Intn(len(str))])
+	}
+	return sb.String()
+}
+
+func TestSeek(t *testing.T) {
+	fd, err := os.OpenFile("./2019-07-19/0.dat", os.O_RDONLY, 0660)
+	if err != nil {
+		t.Fatal("failed to open file")
+	}
+	n, err := fd.Seek(10, 0)
+	if err != nil {
+		t.Fatal("failed to seek", err)
+	}
+	n, err = fd.Seek(-1, 1)
+	if n != 9 {
+		t.Fatalf("failed to seek, pos:%d", n)
 	}
 }

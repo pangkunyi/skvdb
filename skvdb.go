@@ -136,7 +136,7 @@ func New(dataDir string, partitions uint64) *SkvDB {
 
 func (skv *SkvDB) key2Filename(key *Key) string {
 	t := time.Unix(int64(key.Timestamp), 0)
-	index := (uint64(31)*(uint64(31)+uint64(key.Rand))+key.Timestamp) % skv.partitions
+	index := (uint64(31)*(uint64(31)+uint64(key.Rand)) + key.Timestamp) % skv.partitions
 	if index < 0 {
 		index = -index
 	}
@@ -145,10 +145,10 @@ func (skv *SkvDB) key2Filename(key *Key) string {
 
 func (skv *SkvDB) readNextRecord(offset int64, fd *os.File, endOffset int64) (*record, error) {
 	buf := make([]byte, bufSize)
-	if _, err := fd.Seek(offset, 0); err != nil {
+	_, err := fd.Seek(offset, 0)
+	if err != nil {
 		return nil, err
 	}
-	recordStartOffset := int64(0)
 	for {
 		n, err := fd.Read(buf)
 		if err == io.EOF {
@@ -157,49 +157,50 @@ func (skv *SkvDB) readNextRecord(offset int64, fd *os.File, endOffset int64) (*r
 		if err != nil {
 			return nil, err
 		}
-		if n < 1 {
+		if n < lenOfSkvr {
 			return nil, errorNoNextRecord
 		}
 
 		found := false
 		idx := 0
-		for idx < n {
-			if buf[idx] != skvrMagic[0] {
-				idx++
-				recordStartOffset++
-				continue
+		skvrIdx := 0
+		for ; idx < n; idx++ {
+			if buf[idx] == skvrMagic[skvrIdx] {
+				skvrIdx++
+			} else {
+				if skvrIdx > 0 {
+					idx = idx - skvrIdx
+				}
+				skvrIdx = 0
 			}
-			if buf[idx+1] != skvrMagic[1] {
-				idx++
-				recordStartOffset++
-				continue
+			if skvrIdx == lenOfSkvr {
+				found = true
+				break
 			}
-			if buf[idx+2] != skvrMagic[2] {
-				idx = idx + 2
-				recordStartOffset = recordStartOffset + 2
-				continue
-			}
-			if buf[idx+3] != skvrMagic[3] {
-				idx = idx + 3
-				recordStartOffset = recordStartOffset + 3
-				continue
-			}
-			found = true
-			break
 		}
+
 		if found {
-			newOffset := offset + recordStartOffset + lenOfSkvr
-			if _, err := fd.Seek(newOffset, 0); err != nil {
+			newOffset := int64(idx - n + 1)
+			_, err = fd.Seek(newOffset, 1)
+			if err != nil {
 				return nil, err
 			}
 			record, err := skv.tryReadRecord(fd)
 			if err != nil {
-				if _, err := fd.Seek(newOffset, 0); err != nil {
+				_, err = fd.Seek(newOffset, 1)
+				if err != nil {
 					return nil, err
 				}
 				continue
 			}
 			return record, nil
+		}
+		//not found
+		if skvrIdx > 0 {
+			_, err = fd.Seek(int64(-skvrIdx), 1)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 }
@@ -270,8 +271,9 @@ func (skv *SkvDB) QueryByKey(key *Key) ([]byte, error) {
 		return nil, err
 	}
 
+	endOffset := fi.Size()
 	start := int64(0)
-	end := fi.Size()
+	end := endOffset
 	stack := list.New()
 	stack.PushBack([]int64{start, end})
 	for stack.Len() > 0 {
@@ -280,7 +282,7 @@ func (skv *SkvDB) QueryByKey(key *Key) ([]byte, error) {
 		end = startEnd[1]
 		if start <= end {
 			mid := (end + start) / 2
-			record, err := skv.readNextRecord(mid, fd, end)
+			record, err := skv.readNextRecord(mid, fd, endOffset)
 			if err != nil {
 				if err != errorNoNextRecord {
 					return nil, err
