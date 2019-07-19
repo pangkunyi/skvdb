@@ -180,14 +180,13 @@ func (skv *SkvDB) readNextRecord(offset int64, fd *os.File, endOffset int64) (*r
 		}
 
 		if found {
-			newOffset := int64(idx - n + 1)
-			_, err = fd.Seek(newOffset, 1)
+			newOffset, err := fd.Seek(int64(idx-n+1), 1)
 			if err != nil {
 				return nil, err
 			}
 			record, err := skv.tryReadRecord(fd)
 			if err != nil {
-				_, err = fd.Seek(newOffset, 1)
+				_, err = fd.Seek(newOffset, 0)
 				if err != nil {
 					return nil, err
 				}
