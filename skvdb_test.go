@@ -1,6 +1,7 @@
 package skvdb
 
 import (
+	"fmt"
 	"io"
 	"math/rand"
 	"os"
@@ -154,24 +155,27 @@ func TestNewKey(t *testing.T) {
 
 func TestSaveAndQuery(t *testing.T) {
 	db := New(".", 10)
-	size := 100000
-	m := make(map[string]string)
-	for i := 0; i < size; i++ {
-		val := genVal()
-		key, err := db.Save([]byte(val))
-		if err != nil {
-			t.Fatal("failed to save", err)
+	size := 100
+	for batch := 0; batch < 1000; batch++ {
+		fmt.Printf("fmt batch:%d\n", batch)
+		m := make(map[string]string)
+		for i := 0; i < size; i++ {
+			val := genVal()
+			key, err := db.Save([]byte(val))
+			if err != nil {
+				t.Fatal("failed to save", err)
+			}
+			m[key.HexString()] = val
 		}
-		m[key.HexString()] = val
-	}
 
-	for k, v := range m {
-		payload, err := db.Query(k)
-		if err != nil {
-			t.Fatalf("failed to query, key: %s, cause by:%s", k, err)
-		}
-		if v != string(payload) {
-			t.Fatalf("failed to query, key: %s, cause by:%s", k, err)
+		for k, v := range m {
+			payload, err := db.Query(k)
+			if err != nil {
+				t.Fatalf("failed to query, key: %s, cause by:%s", k, err)
+			}
+			if v != string(payload) {
+				t.Fatalf("failed to query, key: %s, cause by:%s", k, err)
+			}
 		}
 	}
 }
