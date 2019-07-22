@@ -7,7 +7,7 @@ import (
 
 const (
 	//CounterPrefetchSize prefetch numbers from counter for performance
-	CounterPrefetchSize = uint64(1)
+	CounterPrefetchSize = uint64(100000)
 )
 
 func (skv *SkvDB) getCounter(callback func(uint64) error) (uint64, error) {
